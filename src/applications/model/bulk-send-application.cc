@@ -31,6 +31,9 @@
 #include "ns3/tcp-socket-factory.h"
 #include "bulk-send-application.h"
 
+// PBS Modification Headers
+#include "ns3/pbs-module.h"
+
 namespace ns3 {
 
 NS_LOG_COMPONENT_DEFINE ("BulkSendApplication");
@@ -194,6 +197,12 @@ void BulkSendApplication::SendData (void)
 
       NS_LOG_LOGIC ("sending packet at " << Simulator::Now ());
       Ptr<Packet> packet = Create<Packet> (toSend);
+
+      // PBS Modification
+      FlowSizeTag flowSizeTag;
+      flowSizeTag.SetFlowSize (m_maxBytes);
+      packet->AddPacketTag (flowSizeTag);
+
       int actual = m_socket->Send (packet);
       if (actual > 0)
         {

@@ -48,7 +48,6 @@
 #include "ns3/packet.h"
 #include "ns3/packet-filter.h"
 #include "ns3/pbs.h"
-#include "ns3/traffic-control-module.h"
 #include "ns3/traffic-control-helper.h"
 #include "ns3/prioTag.h"
 #include "ns3/pbs-switch.h"
@@ -140,13 +139,12 @@ int main(int argc, char *argv[])
 	bool fast = false;
 	bool use_pbs = true;
 	bool use_dctcp = true;
-	bool oversub = false;
-	bool nonblind = false;
 	uint32_t buffer_size = 42400;
+	uint32_t incast_flow_size = 450000;
 	uint32_t threshold = 10;
 	double load_multiplier = 6.0; // increase the load by a constant factor to account for TCP slow-start inefficiency!
         double load = 0.6; // load percentage
-
+	int incast_servers = 1;
 
 	CommandLine cmd;
 	cmd.AddValue("profile", "identifier of the workload distribution to be tested (int)", profile);
@@ -160,45 +158,14 @@ int main(int argc, char *argv[])
 	cmd.AddValue("useDctcp", "switch to toggle DCTCP mode (bool)", use_dctcp);
 	cmd.AddValue("load", "load factor (double)", load);
 	cmd.AddValue("loadMultiplier", "load factor multiplier to increase number of flows (double)", load_multiplier);
-	cmd.AddValue("oversub", "oversubscribed topo 2:1 (bool)", oversub);
-	cmd.AddValue("nonblind", "non-blind version of PBS (bool)", nonblind);
+	cmd.AddValue("incast_servers", "number of incast servers (int)", incast_servers);
+	cmd.AddValue("incastFlowSize", "size in B of incast flow (int)", incast_flow_size);
 	cmd.Parse (argc, argv);
 
-	string cdf_filename = "";
-	string output_directory = "";
-	uint32_t sim_duration = 6000;
-	cout << "Profile = " << profile << "\n";
-	switch (profile)
-	{
-		case 1: // W1
-			cdf_filename = "./sizeDistributions/FacebookKeyValue_Sampled.txt";
-			output_directory = "./results/W1/";
-			tag = "w1_" + tag;
-			break;
-		case 2: // W2
-			cdf_filename = "./sizeDistributions/Google_SearchRPC.txt";
-			output_directory = "./results/W2/";
-			tag = "w2_" + tag;
-			break;
-		case 3: // W3
-			cdf_filename = "./sizeDistributions/Google_AllRPC.txt";
-			output_directory = "./results/W3/";
-			tag = "w3_" + tag;
-			sim_duration = 9000;
-			break;
-		case 4: // W4
-			cdf_filename = "./sizeDistributions/Facebook_HadoopDist_All.txt";
-			output_directory = "./results/W4/";
-			tag = "w4_" + tag;
-			sim_duration = 24000;
-			break;
-		case 5: // W5
-			cdf_filename = "./sizeDistributions/DCTCP_MsgSizeDist.txt";
-			output_directory = "./results/W5/";
-			tag = "w5_" + tag;
-			sim_duration = 24000;
-			break;
-	}
+	// settings for incast workload
+	string output_directory = "./results/incast/";
+	tag = "incast_" + tag;
+	uint32_t sim_duration = 5 * num_flows + 1; // seconds
 
 //=========== Define parameters based on value of k ===========//
 //
@@ -214,9 +181,6 @@ int main(int argc, char *argv[])
 // Note: the format of host's address is 10.pod.switch.(host+2)
 //
 	srand( time(NULL) );
-
-	int target_swRand = 0;		// Random values for servers' address
-	int target_hostRand = 0;	//
 
 // Initialize other variables
 //
@@ -298,10 +262,6 @@ int main(int argc, char *argv[])
 
 //=========== Connect edge switches to hosts ===========//
 
-// NetDeviceContainer for Network Load calculation via tracing
-//
-        NetDeviceContainer networkLoadTracer;
-
 // Initialize Traffic Control Helper
 //
 	TrafficControlHelper tchHost;
@@ -309,8 +269,7 @@ int main(int argc, char *argv[])
 	tchHost.AddPacketFilter(handle, "ns3::PbsPacketFilter",
 				"Alpha", DoubleValue (alpha),
 				"Profile", UintegerValue (profile),
-		       		"UsePbs", BooleanValue (use_pbs),
-				"NonBlind", BooleanValue (nonblind)
+		       		"UsePbs", BooleanValue (use_pbs)
 	);
 	TrafficControlHelper::ClassIdList cls = tchHost.AddQueueDiscClasses (handle, 8, "ns3::QueueDiscClass"); 
 	tchHost.AddChildQueueDiscs (handle, cls, "ns3::RedQueueDisc"); // Must use RED to support ECN
@@ -328,7 +287,6 @@ int main(int argc, char *argv[])
 // Inintialize Address Helper
 //	
   	Ipv4AddressHelper address;
-
 
 	NetDeviceContainer hostSw[num_bridge];		
 	NetDeviceContainer pbsDevices[num_edge];
@@ -350,15 +308,10 @@ int main(int argc, char *argv[])
 			address.SetBase (subnet, "255.255.255.0");
 			Ipv4InterfaceContainer tempContainer = address.Assign( link );
 			ipContainer[j].Add (tempContainer.Get(1) );
-
-			if (!oversub) {
-				networkLoadTracer.Add( link.Get(0) );
-			}
 		}
 	}
 
 	std::cout << "Finished connecting edge switches and hosts  "<< "\n";
-
 
 //=========== Connect aggregate switches to edge switches ===========//
 //
@@ -366,11 +319,7 @@ int main(int argc, char *argv[])
 // Initialize PointtoPoint helper
 //	
 	PointToPointHelper p2p_edgeToAgg;
-	if (oversub) { // 2:1 oversubscription
-  		p2p_edgeToAgg.SetDeviceAttribute ("DataRate", StringValue ("20"+rateUnits));
-	} else {
-  		p2p_edgeToAgg.SetDeviceAttribute ("DataRate", StringValue ("40"+rateUnits));
-	}
+  	p2p_edgeToAgg.SetDeviceAttribute ("DataRate", StringValue ("40"+rateUnits));
   	p2p_edgeToAgg.SetChannelAttribute ("Delay", StringValue ("100ns"));
 			     
 // Installations...
@@ -381,10 +330,6 @@ int main(int argc, char *argv[])
 			ae[j][h] = p2p_edgeToAgg.Install(agg.Get(j), edge.Get(h));
 			qdiscEdgeUp[j][h] = tchSwitch.Install(ae[j][h].Get(1));
 			qdiscAgg[j][h] = tchSwitch.Install(ae[j][h].Get(0));
-
-			if (oversub) {
-				networkLoadTracer.Add( ae[j][h].Get(0) );
-			}
 
 			int second_octet = 0;
 			int third_octet = j+num_host;
@@ -404,206 +349,54 @@ int main(int argc, char *argv[])
 
 	std::cout << "Finished connecting aggregation switches and edge switches  "<< "\n";
 
-//=========== Initialize settings for BulkSend Application ===========//
+//=========== Workload Generation (Unicast) ===========//
 //
-	ifstream cdfFile;
-	cdfFile.open(cdf_filename);
-	if (!cdfFile) {
-		cerr << "Unable to open file " << cdf_filename << endl;
-		cerr << "usage: ./waf --run \"scratch/homatopology --cdfFile=<full path to flowsize CDF file> --alpha=x.x --fast=<true/false> --out=<name for output file>\"" << endl;
-		exit(1);
-	}
-
-	string line;
-	int linecnt = 1;
-	double flowsize = 0.0;
-	double prob = 0.0;
-	cdfFile >> line; // discard first line, which is the average flow-size
-	
-	Ptr<EmpiricalRandomVariable> flow_size_rv = CreateObject<EmpiricalRandomVariable> ();
-
-	// Each line contains : <number of bytes>   <cumulative probability>
-	while (cdfFile >> line) {
-		// even :: number of bytes
-		if (++linecnt % 2 == 0) {
-			flowsize = stof(line);
-			//cout << "flow-size: " << flowsize << "\t\t";
-
-		// odd :: probability of producing that number of bytes
-		} else {
-			prob = stof(line);
-			flow_size_rv->CDF (flowsize, prob);
-			//cout << "probability: " << prob << endl;
-		}
-	}
-	cdfFile.close();	
-
-//=============  Generate traffics for the simulation =============
-//	
-	// N FLOWS (TOTAL) - RANDOM SOURCE --> RANDOM DEST ; POISSON ARRIVALS
+	// N FLOWS (TOTAL) - N SOURCES ->  1 FIXED DESTINATION
 	//
-	// -- In NS3, this is typically achieved using an OnOffApplication
-	// -- 	in which OnTime is determined by a Uniform Random Variable
-	// --   and OffTime is determined by an Exponential Random Variable.
-	// -- We will use an Empirical Random Variable to select the flow sizes.
-	//
-	// -- To achieve a given aggregate network load, we will make use of
-	// --   the property of Poisson Processes that the superposition of
-	// --   many such processes from independent sources each with rate
-	// --   lambda_i results in an aggreagate rate SUM_i (lambda_i).
-	//
-	// -- Note: If lambda is the rate, then 1/lambda is the average
-	// --   interarrival time of the corresponding Exponential Distribution.
-	//
-	double link_rate = 10e9; // Bottleneck link rate
-	double avgPacketSize = 1460; // bytes
-	double meanFlowSize = 1138 * avgPacketSize; // num_packets
-	switch (profile)
-	{
-		case 1:
-			meanFlowSize = 407.1;
-			break;
-		case 2:
-			meanFlowSize = 654.4;
-			break;
-		case 3:
-			meanFlowSize = 3259.3;
-			break;
-		case 4:
-			meanFlowSize = 136469.3;
-			break;
-		case 5:
-			meanFlowSize = 1819002.1;
-			break;
-	}
-	//double lam = (link_rate*load)/(meanFlowSize*8.0/1460*1500);
-	double lam = (link_rate*load*load_multiplier)/(meanFlowSize*8.0);
-	cout << "Lambda Per Source: " << lam << " flows/s per source\n";
-	double mean_t = 1.0/lam * 10e9; // nanoseconds
-	cout << "Mean Inter-Arrival Time: " << mean_t << " ns\n";
-
-	int num_apps_per_host = max(1, (int)(num_flows / 144));
-	ApplicationContainer app[num_edge][num_host][num_apps_per_host];
+	ApplicationContainer app[incast_servers][num_flows];
 	ApplicationContainer sink;
 	
-	// 144 Poisson Process, 1-process-per-host 
-	for (i = 0; i < num_edge; i++)
+	int target_edge = 0;
+        int target_host = 0;
+	// Initialize Starting Time for the app on every host
+	uint64_t app_start_time = 50;	
+	// 1-process-per-host . Total number of hosts = incast_servers
+	for (i = 0; i < (int)num_flows; i++)
 	{
-		for (j = 0; j < num_host; j++)
+		for (j = 0; j < incast_servers; j++)
 		{
-		// Create independent Exponential RV for local Poisson Process on this host
-			Ptr<ExponentialRandomVariable> expRv = CreateObject<ExponentialRandomVariable> ();
-			expRv->SetAttribute ("Mean", DoubleValue (mean_t) );
+			// select a source (client)
+			int src_edge = (int)(rand() % (num_edge-1) + 0) + 1;
+			int src_host = (int)(rand() % (num_host-1) + 0);
+			Ipv4Address targetIp = ipContainer[target_edge].GetAddress(target_host);
+			Address targetAddress = Address( InetSocketAddress( targetIp, port ));
 
-		// Initialize Starting Time for 1st app on this host
-			uint64_t next_app_start_time = (uint64_t)(expRv->GetValue ());
-
-		// Create applications on this host
-			for (k = 0; k < num_apps_per_host; k++)
-			{
-			// Randomly select a target (server)
-				target_swRand = rand() % num_edge + 0;
-				target_hostRand = rand() % num_host + 0;
-				while (target_swRand == i){
-			 		target_swRand = rand() % num_edge + 0;
-			 	} // to make sure that client and server are not in same rack
-				Ipv4Address targetIp = ipContainer[target_swRand].GetAddress(target_hostRand);
-				Address targetAddress = Address( InetSocketAddress( targetIp, port ));
-
-			// Initialize BulkSend Application with address of target, and Flowsize from Empirical RV
-				uint32_t bytesToSend = (uint32_t) flow_size_rv->GetValue();
-				//uint32_t bytesToSend = (uint32_t)(407.1);
-				BulkSendHelper bs = BulkSendHelper("ns3::TcpSocketFactory", targetAddress);
-				bs.SetAttribute ("MaxBytes", UintegerValue (bytesToSend));
-				bs.SetAttribute ("SendSize", UintegerValue (1460));
+			// Initialize BulkSend Application with address of target, and Flowsize
+			uint32_t bytesToSend = incast_flow_size;
+			BulkSendHelper bs = BulkSendHelper("ns3::TcpSocketFactory", targetAddress);
+			bs.SetAttribute ("MaxBytes", UintegerValue (bytesToSend));
+			bs.SetAttribute ("SendSize", UintegerValue (1460));
 
 			// Install BulkSend Application to the sending node (client)
-				NodeContainer bulksend;
-				bulksend.Add(host[i].Get(j));
-				app[i][j][k] = bs.Install (bulksend);
-
-			// Set Approximate Poisson Arrival Start Time for next Flow on this host
-				app[i][j][k].Start (NanoSeconds (next_app_start_time));
-				next_app_start_time += (uint64_t)(expRv->GetValue ());
-
-			} // num_apps_per_host
-		} // num_hosts
-	} // num_edges
-
-	// Packet Sink in every potential target Host
-	for(i=0;i<num_edge;i++){
-		for(j=0;j<num_host;j++){
-			PacketSinkHelper sh = PacketSinkHelper("ns3::TcpSocketFactory",
-						Address(InetSocketAddress(Ipv4Address::GetAny(), port)));	
-			sink = sh.Install(host[i].Get(j));
+			NodeContainer bulksend;
+			bulksend.Add(host[src_edge].Get(src_host));
+			app[j][i] = bs.Install (bulksend);
+			app[j][i].Start (Seconds (i) + NanoSeconds (app_start_time));
 		}
 	}
 
-/*
-	// FOR ONE FLOW
-	ApplicationContainer app;
-	ApplicationContainer sink;
-
-	// Random jitter for first app start time
-	//uint64_t next_app_start = rand() % num_apps_per_host*10000 + 0;
-	double mean = 3.14;
-	double bound = 0.0;
-	Ptr<ExponentialRandomVariable> x = CreateObject<ExponentialRandomVariable> ();
-	x->SetAttribute ("Mean", DoubleValue (mean));
-	x->SetAttribute ("Bound", DoubleValue (bound));
-	//uint64_t next_app_start = x->GetValue() * 1000000000; // times 1s in ns
-	uint64_t next_app_start = 0;
-
-	// Arbitrarily select a source (client)
-	int source_swRand = 0;
-	int source_hostRand = 0;
-
-	// Randomly select a target (server)
-	target_swRand = rand() % num_edge + 0;
-	target_hostRand = rand() % num_host + 0;
-	while (target_swRand == source_swRand){
-		target_swRand = rand() % num_edge + 0;
-		target_hostRand = rand() % num_host + 0;
-	} // to make sure that client and server are different
-
-	Ipv4Address targetIp = ipContainer[target_swRand].GetAddress(target_hostRand);
-	InetSocketAddress targetSock = InetSocketAddress(targetIp, port);
-	Address targetAddress = Address(targetSock);
-
-	// Initialize Bulk Send Application 1 with address of target
-	//uint32_t bytesToSend = (uint32_t) flow_size_rv->GetValue();
-	//uint32_t bytesToSend = 100000000;
-	//uint32_t bytesToSend = 1000000000;
-	uint32_t bytesToSend = 100;
-	cout << "Bytes To Send: " << bytesToSend << endl;
-	BulkSendHelper bs = BulkSendHelper("ns3::TcpSocketFactory", targetAddress);
-	bs.SetAttribute ("MaxBytes", UintegerValue (bytesToSend));
-
-	// Install BulkSend Application to the sending node (client)
-	NodeContainer bulksend;
-	bulksend.Add(host[source_swRand].Get(source_hostRand));
-	app = bs.Install (bulksend);
-
-	// Set Ontime & Time to start next application 
-	app.Start (NanoSeconds (next_app_start));
-			
-	// Packet Sink in every potential target Host
+	// Packet Sink in one fixed destination host
 	for(i=0;i<num_edge;i++){
-		for(j=0;j<num_host;j++){
-			PacketSinkHelper sh = PacketSinkHelper("ns3::TcpSocketFactory",
-						Address(InetSocketAddress(Ipv4Address::GetAny(), port)));	
-			sink = sh.Install(host[i].Get(j));
-		}
-	}
-
-
-*/	
-
-	std::cout << "Finished creating BulkSend traffic"<<"\n";
+                for(j=0;j<num_host;j++){
+                        PacketSinkHelper sh = PacketSinkHelper("ns3::TcpSocketFactory",
+                                                Address(InetSocketAddress(Ipv4Address::GetAny(), port)));       
+                        sink = sh.Install(host[i].Get(j));
+                }
+        }
+	std::cout << "Finished creating Incast traffic"<<"\n";
 
 //=========== Start the simulation ===========//
 //
-
 	std::cout << "Start Simulation.. "<<"\n";
 
 // Populate Routing Tables
@@ -615,38 +408,15 @@ int main(int argc, char *argv[])
   	FlowMonitorHelper flowmon;
 	Ptr<FlowMonitor> monitor = flowmon.InstallAll();
 
-// Add Tracing to Track Egress Traffic
-//
-	AsciiTraceHelper ascii;
-	p2p_edgeToAgg.EnableAscii( ascii.CreateFileStream (output_directory + tag + ".load.tr"), networkLoadTracer );
-
 // Run simulation.
 //
   	NS_LOG_INFO ("Run Simulation.");
-	Simulator::Stop (MicroSeconds(sim_duration));
+	Simulator::Stop (Seconds(sim_duration));
 
 // Start Simulation
   	Simulator::Run ();
 
   	monitor->CheckForLostPackets ();
-
-	//Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier> (flowmon.GetClassifier ());
-	//FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats ();
-	//for (std::map<FlowId, FlowMonitor::FlowStats>::const_iterator i = stats.begin (); i != stats.end (); ++i)
-	//{
-	//	Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow (i->first);
-	//	std::cout << "Flow " << i->first  << " (" << t.sourceAddress << " -> " << t.destinationAddress << ")\n";
-	//	std::cout << "  Source Port " << t.sourcePort << "\n";
-	//	std::cout << "  Tx Packets: " << i->second.txPackets << "\n";
-	//	std::cout << "  Tx Bytes:   " << i->second.txBytes << "\n";
-	//	std::cout << "  TxOffered:  " << i->second.txBytes * 8.0 / 9.0 / 1000 / 1000  << " Mbps\n";
-	//	std::cout << "  Rx Packets: " << i->second.rxPackets << "\n";
-	//	std::cout << "  Rx Bytes:   " << i->second.rxBytes << "\n";
-	//	std::cout << "  Throughput: " << i->second.rxBytes * 8.0 / 9.0 / 1000 / 1000  << " Mbps\n";
-
-	//	uint64_t duration = (i->second.timeLastRxPacket - i->second.timeFirstTxPacket).GetNanoSeconds ();
-	//	std::cout << "  Duration:   " << duration << "\n";
-	//}
 
   	monitor->SerializeToXmlFile(filename, true, true);
 
@@ -657,95 +427,23 @@ int main(int argc, char *argv[])
 
 // Print Results stored in PbsPacketFilters
 //
-	ofstream pbs_stats;
-	ofstream pbs_egress;
-	ofstream pbs_packets;
 	ofstream pbs_prio;
 	ofstream pbs_rawprio;
-	ofstream pbs_categories;
-	pbs_stats.open (output_directory + tag + ".stats");
-	pbs_egress.open (output_directory + tag + ".egress");
-	pbs_packets.open (output_directory + tag + ".packets");
 	pbs_prio.open (output_directory + tag + ".prio");
 	pbs_rawprio.open (output_directory + tag + ".rawprio");
-	pbs_categories.open (output_directory + tag + ".categories");
 
-	pbs_stats << "\n*** QueueDisc statistics (Host) ***\n";
 	for (i = 0; i < num_edge; i++) {
 		for (uint32_t k = 0; k < qdiscHost[i].GetN(); k++)
 		{
-			pbs_stats << "Host[" << i << "][" << k << "]\n";
 			Ptr<QueueDisc> q = qdiscHost[i].Get (k);
 			PbsPacketFilter *pf = dynamic_cast<PbsPacketFilter*>( PeekPointer (q->GetPacketFilter (0)) );
-			pf->PrintStats (pbs_stats);
 			pf->StreamToCsv (pbs_prio);
-			pf->StreamPacketsToCsv (pbs_packets);
 			pf->StreamRawPrioToCsv (pbs_rawprio);
-
-			map<uint64_t, uint64_t> loadAtTime = pf->PeekLoadAtTime ();
-			for (auto it = loadAtTime.begin(); it != loadAtTime.end(); ++it)
-			{
-				pbs_egress << it->first << "," << it->second << ",10" << rateUnits << "\n";
-			}
 		}
 	}
 
-	pbs_stats << "\n*** QueueDisc statistics (EdgeDown) ***\n";
-	for (i = 0; i < num_edge; i++) {
-		for (uint32_t k = 0; k < qdiscEdgeDown[i].GetN(); k++)
-		{
-			pbs_stats << "EdgeDown[" << i << "]\n";
-			Ptr<QueueDisc> q = qdiscEdgeDown[i].Get (k);
-			PbsSwitchPacketFilter *pf = dynamic_cast<PbsSwitchPacketFilter*>( PeekPointer (q->GetPacketFilter (0)) );
-			pf->PrintStats (pbs_stats);
-		}
-	}
-
-	pbs_stats << "\n*** QueueDisc statistics (EdgeUp) ***\n";
-	for (i = 0; i < num_agg; i++) {
-		for (int k = 0; k < num_edge; k++)
-		{
-			pbs_stats << "EdgeUp[" << i << "][" << k << "]\n";
-			Ptr<QueueDisc> q = qdiscEdgeUp[i][k].Get (0);
-			PbsSwitchPacketFilter *pf = dynamic_cast<PbsSwitchPacketFilter*>( PeekPointer (q->GetPacketFilter (0)) );
-			pf->PrintStats (pbs_stats);
-		}
-	}
-
-	// To calculate Network load: snapshot total egress from every switch every nanosecond
-	// To get "total egress" we look at the packets enqueued to 1 group of packet filters
-	// - agg - will see egress sent from agg->edges, which is limited by the max BsBw
-	pbs_egress << "#<Time Bucket>,<Total Egress Bytes-Per-Second>,<Link Rate>\n";
-
-	pbs_stats << "\n*** QueueDisc statistics (Agg) ***\n";
-	pbs_categories << "flow_id,total_bytes,p0_bytes,p1_bytes,p2_bytes,p3_bytes,p4_bytes,p5_bytes,p6_bytes,p7_bytes,\n";
-	for (i = 0; i < num_agg; i++) {
-		for (int k = 0; k < num_edge; k++)
-		{
-			pbs_stats << "Agg[" << i << "][" << k << "]\n";
-			Ptr<QueueDisc> q = qdiscAgg[i][k].Get (0);
-			PbsSwitchPacketFilter *pf = dynamic_cast<PbsSwitchPacketFilter*>( PeekPointer (q->GetPacketFilter (0)) );
-			pf->PrintStats (pbs_stats);
-
-			pf->PrintFlowCategories (pbs_categories);
-
-			//// for every down-facing aggregate-switch filter, for every nanosecond in which that filter is processing a packet
-			//// record the egress in total bytes from that filter
-			//map<uint64_t, uint64_t> loadAtTime = pf->PeekLoadAtTime ();
-			//for (auto it = loadAtTime.begin(); it != loadAtTime.end(); ++it)
-			//{
-			//	pbs_egress << it->first << "," << it->second << ",40" << rateUnits << "\n";
-			//}
-		}
-	}
-
-
-	pbs_stats.close();
-	pbs_egress.close();
-	pbs_packets.close();
 	pbs_prio.close();
 	pbs_rawprio.close();
-	pbs_categories.close();
 
 	return 0;
 }

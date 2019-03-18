@@ -11,6 +11,7 @@ def build(bld):
     module.source = [
         'model/pbs.cc',
 	'model/prioTag.cc',
+	'model/flowSizeTag.cc',
     #    'helper/pbs-helper.cc',
         ]
 
@@ -24,6 +25,7 @@ def build(bld):
     headers.source = [
         'model/pbs.h',
 	'model/prioTag.h',
+	'model/flowSizeTag.h',
     #    'helper/pbs-helper.h',
         ]
 
