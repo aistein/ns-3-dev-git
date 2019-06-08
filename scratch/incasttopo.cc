@@ -136,9 +136,12 @@ int main(int argc, char *argv[])
 	string tag = "";
 	double alpha = 0.001;
 	uint32_t num_flows = 1;
+	bool debug = false;
 	bool fast = false;
 	bool use_pbs = true;
 	bool use_dctcp = true;
+	bool same_buff = false;
+	bool nonblind = false;
 	uint32_t buffer_size = 42400;
 	uint32_t incast_flow_size = 450000;
 	uint32_t threshold = 10;
@@ -153,6 +156,8 @@ int main(int argc, char *argv[])
 	cmd.AddValue("fast", "speed up simulation by using Mbps links instead of Gbps links (bool)", fast);
 	cmd.AddValue("apps", "how many apps to run (int)", num_flows);
 	cmd.AddValue("buff", "buffer size of each switch (int)", buffer_size);
+	cmd.AddValue("sameBuff", "let the buffer size of each PBS queue equal that of the entire DCTCP queue (bool)", same_buff);
+	cmd.AddValue("debug", "enable pcap tracing on all hosts and switchs for debugging (bool)", debug);
 	cmd.AddValue("thresh", "dctcp threshold value (int)", threshold);
 	cmd.AddValue("usePbs", "switch to toggle PBS mode (bool)", use_pbs);
 	cmd.AddValue("useDctcp", "switch to toggle DCTCP mode (bool)", use_dctcp);
@@ -160,6 +165,7 @@ int main(int argc, char *argv[])
 	cmd.AddValue("loadMultiplier", "load factor multiplier to increase number of flows (double)", load_multiplier);
 	cmd.AddValue("incast_servers", "number of incast servers (int)", incast_servers);
 	cmd.AddValue("incastFlowSize", "size in B of incast flow (int)", incast_flow_size);
+	cmd.AddValue("nonblind", "non-blind version of PBS (bool)", nonblind);
 	cmd.Parse (argc, argv);
 
 	// settings for incast workload
@@ -221,7 +227,7 @@ int main(int argc, char *argv[])
 // Initialize Internet Stack and Routing Protocols
 //	
 	// Basic Settings
-	if (use_pbs) {
+	if (use_pbs && !same_buff) {
 		buffer_size /= 8;
 	}
 	Config::SetDefault ("ns3::Ipv4GlobalRouting::RandomEcmpRouting", BooleanValue (true));
@@ -262,6 +268,10 @@ int main(int argc, char *argv[])
 
 //=========== Connect edge switches to hosts ===========//
 
+// NetDeviceContainer for Debug Tracing
+//
+	NetDeviceContainer debugTracer;
+
 // Initialize Traffic Control Helper
 //
 	TrafficControlHelper tchHost;
@@ -269,7 +279,8 @@ int main(int argc, char *argv[])
 	tchHost.AddPacketFilter(handle, "ns3::PbsPacketFilter",
 				"Alpha", DoubleValue (alpha),
 				"Profile", UintegerValue (profile),
-		       		"UsePbs", BooleanValue (use_pbs)
+		       		"UsePbs", BooleanValue (use_pbs),
+				"NonBlind", BooleanValue (nonblind)
 	);
 	TrafficControlHelper::ClassIdList cls = tchHost.AddQueueDiscClasses (handle, 8, "ns3::QueueDiscClass"); 
 	tchHost.AddChildQueueDiscs (handle, cls, "ns3::RedQueueDisc"); // Must use RED to support ECN
@@ -308,6 +319,11 @@ int main(int argc, char *argv[])
 			address.SetBase (subnet, "255.255.255.0");
 			Ipv4InterfaceContainer tempContainer = address.Assign( link );
 			ipContainer[j].Add (tempContainer.Get(1) );
+
+			if (debug) {
+				debugTracer.Add( link.Get(0) );
+				debugTracer.Add( link.Get(1) );
+			}
 		}
 	}
 
@@ -330,6 +346,11 @@ int main(int argc, char *argv[])
 			ae[j][h] = p2p_edgeToAgg.Install(agg.Get(j), edge.Get(h));
 			qdiscEdgeUp[j][h] = tchSwitch.Install(ae[j][h].Get(1));
 			qdiscAgg[j][h] = tchSwitch.Install(ae[j][h].Get(0));
+
+			if (debug) {
+				debugTracer.Add( ae[j][h].Get(0) );
+				debugTracer.Add( ae[j][h].Get(1) );
+			}
 
 			int second_octet = 0;
 			int third_octet = j+num_host;
@@ -355,35 +376,63 @@ int main(int argc, char *argv[])
 	//
 	ApplicationContainer app[incast_servers][num_flows];
 	ApplicationContainer sink;
+
+	// Approx Time to Complete 450kB flow over TCP = ...
+	// (prop-delay + handshake-or-ack-pkt-size * 8-bits / botlneck-rate) * 3 +
+	// (prop-delay + (flowsize + 40 * flowsize//1460) * 8-bits / botlneck-rate)
+	// (220e-9 + 40*8 / 10e9)*3 + (220e-9 + 463e3*8 / 10e9)
+	//int time_per_flow = 371000; // nanoseconds
+	int time_per_flow = 47424368; // nanoseconds (for 128-degree incast only)
 	
 	int target_edge = 0;
         int target_host = 0;
-	// Initialize Starting Time for the app on every host
-	uint64_t app_start_time = 50;	
+	Ipv4Address targetIp = ipContainer[target_edge].GetAddress(target_host);
+	Address targetAddress = Address( InetSocketAddress( targetIp, port ));
 	// 1-process-per-host . Total number of hosts = incast_servers
-	for (i = 0; i < (int)num_flows; i++)
-	{
+	//for (i = 0; i < (int)num_flows; i++)
+	//{
+		vector<int> senders;
+		//for (int i=0; i<incast_servers; ++i) senders.push_back(i);
+		for (int i=0; i<incast_servers; ++i) senders.push_back( rand() % (total_host - num_host) + num_host );
+		random_shuffle ( senders.begin(), senders.end() );
+		auto it = senders.begin();
 		for (j = 0; j < incast_servers; j++)
 		{
 			// select a source (client)
-			int src_edge = (int)(rand() % (num_edge-1) + 0) + 1;
-			int src_host = (int)(rand() % (num_host-1) + 0);
-			Ipv4Address targetIp = ipContainer[target_edge].GetAddress(target_host);
-			Address targetAddress = Address( InetSocketAddress( targetIp, port ));
+			//int src_edge = (int)(rand() % (num_edge-1) + 0) + 1;
+			//int src_host = (int)(rand() % (num_host-1) + 0);
+			//int src_edge = (*it) / num_host + 1;
+			int src_edge = (*it) / num_host;
+			int src_host = (*it) % num_host;
+			std::cout << "src=" << (*it) << "\tsrc_edge=" << src_edge << "\tsrc_host=" << src_host << std::endl;
+			++it;
 
 			// Initialize BulkSend Application with address of target, and Flowsize
 			uint32_t bytesToSend = incast_flow_size;
-			BulkSendHelper bs = BulkSendHelper("ns3::TcpSocketFactory", targetAddress);
-			bs.SetAttribute ("MaxBytes", UintegerValue (bytesToSend));
-			bs.SetAttribute ("SendSize", UintegerValue (1460));
+
+			//BulkSendHelper bs = BulkSendHelper("ns3::TcpSocketFactory", targetAddress);
+			//bs.SetAttribute ("MaxBytes", UintegerValue (bytesToSend));
+			//bs.SetAttribute ("SendSize", UintegerValue (1460));
+
+			IncastHelper is = IncastHelper("ns3::TcpSocketFactory", targetAddress);
+			is.SetAttribute ("MaxBytes", UintegerValue (bytesToSend));
+			is.SetAttribute ("SendSize", UintegerValue (1460));
+			//is.SetAttribute ("NumFlows", UintegerValue (1));
+			is.SetAttribute ("NumFlows", UintegerValue (num_flows));
 
 			// Install BulkSend Application to the sending node (client)
-			NodeContainer bulksend;
-			bulksend.Add(host[src_edge].Get(src_host));
-			app[j][i] = bs.Install (bulksend);
-			app[j][i].Start (Seconds (i) + NanoSeconds (app_start_time));
+				//NodeContainer bulksend;
+				//bulksend.Add(host[src_edge].Get(src_host));
+				//app[j][i] = bs.Install (bulksend);
+				//app[j][i].Start (NanoSeconds (time_per_flow * i + (rand() % 1000))); // up to 1us random jitter
+			NodeContainer incast;
+			incast.Add(host[src_edge].Get(src_host));
+			// TODO: fixme - there is no meaningful 'i' anymore!
+			app[j][i] = is.Install (incast);
+			//app[j][i].Start (NanoSeconds (time_per_flow * i + (rand() % 1000))); // up to 1us random jitter
+			app[j][i].Start (NanoSeconds (time_per_flow * 0 + 100)); // up to 1us random jitter
 		}
-	}
+	//}
 
 	// Packet Sink in one fixed destination host
 	for(i=0;i<num_edge;i++){
@@ -407,6 +456,14 @@ int main(int argc, char *argv[])
 //
   	FlowMonitorHelper flowmon;
 	Ptr<FlowMonitor> monitor = flowmon.InstallAll();
+
+// Add Tracing for Debugging
+//
+	if (debug) {
+		AsciiTraceHelper ascii;
+		p2p_edgeToAgg.EnableAscii( ascii.CreateFileStream (output_directory + tag + ".load.tr"), debugTracer);
+		p2p_edgeToAgg.EnablePcapAll( output_directory + tag );
+	}
 
 // Run simulation.
 //
